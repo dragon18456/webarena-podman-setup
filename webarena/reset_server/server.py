@@ -965,6 +965,34 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 # Main
 # ---------------------------------------------------------------------------
 
+def kill_old_server_on_port(port: int):
+    """Stop an older reset server before initializing fresh containers."""
+    r = subprocess.run(["ss", "-tlnp", f"sport = :{port}"],
+                       capture_output=True, text=True, check=False)
+    for line in r.stdout.splitlines():
+        if f":{port}" not in line:
+            continue
+        import re
+        m = re.search(r"pid=(\d+)", line)
+        if not m:
+            continue
+        old_pid = int(m.group(1))
+        if old_pid == os.getpid():
+            continue
+        logger.warning("Killing old server on port %d (pid %d)", port, old_pid)
+        os.kill(old_pid, signal.SIGTERM)
+        for _ in range(30):
+            time.sleep(1)
+            r2 = subprocess.run(["ss", "-tlnp", f"sport = :{port}"],
+                                capture_output=True, text=True, check=False)
+            if f":{port}" not in r2.stdout:
+                break
+        else:
+            logger.warning("Force-killing old server (pid %d)", old_pid)
+            os.kill(old_pid, signal.SIGKILL)
+            time.sleep(2)
+
+
 def main():
     global server_instance
 
@@ -974,6 +1002,10 @@ def main():
                         help="First-time init: create all container instances and set up iptables")
     parser.add_argument("--state-file", default=STATE_FILE, help="Path to state JSON file")
     args = parser.parse_args()
+
+    # The outgoing server tears down its managed containers on SIGTERM. Kill it
+    # before init/resume so it cannot erase a freshly initialized pool.
+    kill_old_server_on_port(args.port)
 
     server_instance = HotSwapServer(SERVICES, STATIC_SERVICES, args.state_file)
 
@@ -995,30 +1027,6 @@ def main():
     signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(0)))
     signal.signal(signal.SIGHUP, signal.SIG_IGN)  # ignore SSH disconnect
     atexit.register(cleanup)
-
-    # Kill any old server on this port and wait for it to release
-    r = subprocess.run(["ss", "-tlnp", f"sport = :{args.port}"],
-                       capture_output=True, text=True, check=False)
-    for line in r.stdout.splitlines():
-        if f":{args.port}" in line:
-            import re
-            m = re.search(r"pid=(\d+)", line)
-            if m:
-                old_pid = int(m.group(1))
-                if old_pid != os.getpid():
-                    logger.warning("Killing old server on port %d (pid %d)", args.port, old_pid)
-                    os.kill(old_pid, signal.SIGTERM)
-                    # Wait for port to be released
-                    for _ in range(30):
-                        time.sleep(1)
-                        r2 = subprocess.run(["ss", "-tlnp", f"sport = :{args.port}"],
-                                            capture_output=True, text=True, check=False)
-                        if f":{args.port}" not in r2.stdout:
-                            break
-                    else:
-                        logger.warning("Force-killing old server (pid %d)", old_pid)
-                        os.kill(old_pid, signal.SIGKILL)
-                        time.sleep(2)
 
     httpd = http.server.ThreadingHTTPServer(("", args.port), RequestHandler)
     logger.info("Serving on port %d...", args.port)
