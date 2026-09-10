@@ -233,9 +233,182 @@ validate_services_config()
 
 NGINX_CONF_DIR = "/etc/nginx/conf.d"
 NGINX_CONF_FILE = os.path.join(NGINX_CONF_DIR, "webarena-hotswap.conf")
+NGINX_PID_FILE = "/run/nginx.pid"
+NGINX_SERVICE = "nginx.service"
+NGINX_DEFAULT_SITES = (
+    "/etc/nginx/sites-enabled/default",
+    "/etc/nginx/conf.d/default.conf",
+)
 
 # Track current port mappings so we can write a single config file
 _port_mappings: dict[int, int] = {}  # public_port → target_port
+
+
+def _run_no_raise(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+    except FileNotFoundError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+def _disable_system_nginx():
+    """Keep systemd from racing the reset server for nginx ownership."""
+    for args in (
+        ["systemctl", "stop", NGINX_SERVICE],
+        ["systemctl", "disable", NGINX_SERVICE],
+        ["systemctl", "mask", NGINX_SERVICE],
+    ):
+        result = _run_no_raise(args, timeout=60)
+        if result.returncode not in (0, 1, 5, 127):
+            logger.warning("%s failed: %s", " ".join(args), result.stderr.strip())
+
+
+def _remove_default_nginx_sites():
+    """Remove distro defaults that bind port 80 and conflict with the homepage."""
+    for default_site in NGINX_DEFAULT_SITES:
+        try:
+            if os.path.lexists(default_site):
+                os.unlink(default_site)
+        except OSError as e:
+            logger.warning("Could not remove nginx default site %s: %s", default_site, e)
+
+
+def _process_root_is_host(pid: int) -> bool:
+    try:
+        return os.path.realpath(f"/proc/{pid}/root") == "/"
+    except OSError:
+        return False
+
+
+def _host_nginx_master_pids() -> list[int]:
+    """Return only host nginx master PIDs, excluding nginx inside containers."""
+    result = _run_no_raise(["ps", "-eo", "pid=,cmd="], timeout=15)
+    if result.returncode != 0:
+        logger.warning("Could not list processes for nginx cleanup: %s", result.stderr.strip())
+        return []
+
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, cmd = parts
+        if not cmd.startswith("nginx: master process"):
+            continue
+        if "/opt/gitlab/embedded/" in cmd:
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if _process_root_is_host(pid):
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _wait_for_pids_to_exit(pids: list[int], timeout: float = 10.0) -> list[int]:
+    deadline = time.time() + timeout
+    remaining = list(pids)
+    while remaining and time.time() < deadline:
+        still_running = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                still_running.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                still_running.append(pid)
+        remaining = still_running
+        if remaining:
+            time.sleep(0.2)
+    return remaining
+
+
+def _stop_host_nginx():
+    """Stop only host nginx masters; container nginx processes are left alone."""
+    pids = _host_nginx_master_pids()
+    if not pids:
+        try:
+            if os.path.exists(NGINX_PID_FILE):
+                os.remove(NGINX_PID_FILE)
+        except OSError as e:
+            logger.warning("Could not remove stale nginx pid file: %s", e)
+        return
+
+    logger.info("Stopping host nginx masters: %s", pids)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            logger.warning("Could not terminate host nginx pid %d: %s", pid, e)
+
+    remaining = _wait_for_pids_to_exit(pids)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            logger.warning("Could not kill host nginx pid %d: %s", pid, e)
+    _wait_for_pids_to_exit(remaining, timeout=5.0)
+
+    try:
+        if os.path.exists(NGINX_PID_FILE):
+            os.remove(NGINX_PID_FILE)
+    except OSError as e:
+        logger.warning("Could not remove nginx pid file after stop: %s", e)
+
+
+def _validate_nginx_config():
+    result = _run_no_raise(["nginx", "-t"], timeout=30)
+    if result.returncode != 0:
+        logger.error("nginx config test failed: %s", result.stderr.strip())
+        raise RuntimeError("nginx config test failed")
+
+
+def _start_host_nginx():
+    _validate_nginx_config()
+    result = _run_no_raise(["nginx"], timeout=30)
+    if result.returncode != 0:
+        logger.error("nginx start failed: %s", result.stderr.strip())
+        raise RuntimeError("nginx start failed")
+
+
+def _nginx_pid_is_usable() -> bool:
+    try:
+        with open(NGINX_PID_FILE) as f:
+            raw_pid = f.read().strip()
+        pid = int(raw_pid)
+    except (OSError, ValueError):
+        return False
+
+    return _process_root_is_host(pid) and pid in _host_nginx_master_pids()
+
+
+def _restart_host_nginx():
+    _stop_host_nginx()
+    time.sleep(1)
+    _start_host_nginx()
+    if not _nginx_pid_is_usable():
+        raise RuntimeError("nginx started without a usable host pid file")
+
+
+def _reload_or_restart_nginx():
+    _validate_nginx_config()
+    if not _nginx_pid_is_usable():
+        logger.warning("nginx pid file is missing or stale; restarting host nginx")
+        _restart_host_nginx()
+        return
+
+    result = _run_no_raise(["nginx", "-s", "reload"], timeout=30)
+    if result.returncode == 0:
+        return
+
+    logger.warning("nginx reload failed, restarting host nginx: %s", result.stderr.strip())
+    _restart_host_nginx()
 
 
 def _write_nginx_conf():
@@ -256,7 +429,7 @@ def _write_nginx_conf():
     conf = "\n\n".join(blocks) + "\n"
     with open(NGINX_CONF_FILE, "w") as f:
         f.write(conf)
-    subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=True)
+    _reload_or_restart_nginx()
 
 
 def set_redirect(public_port: int, target_port: int):
@@ -267,10 +440,10 @@ def set_redirect(public_port: int, target_port: int):
 
 
 def cleanup_nginx():
-    """Remove our nginx config and reload."""
+    """Remove our nginx config and stop the host nginx owned by this server."""
     if os.path.exists(NGINX_CONF_FILE):
         os.remove(NGINX_CONF_FILE)
-        subprocess.run(["nginx", "-s", "reload"], capture_output=True, check=False)
+    _stop_host_nginx()
     _port_mappings.clear()
 
 # ---------------------------------------------------------------------------
@@ -743,17 +916,13 @@ class HotSwapServer:
 
     def _ensure_nginx(self):
         """Ensure nginx is running with a clean hotswap config."""
+        _disable_system_nginx()
+        _remove_default_nginx_sites()
+
         # Write empty config so nginx doesn't try to bind stale ports
         with open(NGINX_CONF_FILE, "w") as f:
             f.write("# managed by server.py\n")
-        r = subprocess.run(["nginx", "-t"], capture_output=True, check=False)
-        if r.returncode != 0:
-            logger.error("nginx config test failed: %s", r.stderr)
-            return
-        # Kill all nginx processes to guarantee old port bindings are released
-        subprocess.run(["pkill", "-9", "nginx"], capture_output=True, check=False)
-        time.sleep(1)
-        subprocess.run(["nginx"], capture_output=True, check=False)
+        _restart_host_nginx()
         logger.info("nginx is ready")
 
     def _init_static_services(self):
@@ -917,39 +1086,43 @@ server_instance: HotSwapServer | None = None
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        params = parse_qs(parsed.query)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            params = parse_qs(parsed.query)
 
-        if path == "/reset":
-            services = None
-            if "services" in params:
-                services = [s.strip() for s in params["services"][0].split(",") if s.strip()]
-            status_code, message = server_instance.reset(services)
-            self._respond(status_code, {"message": message})
+            if path == "/reset":
+                services = None
+                if "services" in params:
+                    services = [s.strip() for s in params["services"][0].split(",") if s.strip()]
+                status_code, message = server_instance.reset(services)
+                self._respond(status_code, {"message": message})
 
-        elif path == "/status":
-            self._respond(200, server_instance.status())
+            elif path == "/status":
+                self._respond(200, server_instance.status())
 
-        elif path == "/shrink":
-            result = {}
-            for name, pool in server_instance.pools.items():
-                removed = pool.shrink_to_max()
-                if removed:
-                    result[name] = f"removed instances {removed}"
-            server_instance._save_state()
-            self._respond(200, {"message": "Shrink complete", "result": result})
+            elif path == "/shrink":
+                result = {}
+                for name, pool in server_instance.pools.items():
+                    removed = pool.shrink_to_max()
+                    if removed:
+                        result[name] = f"removed instances {removed}"
+                server_instance._save_state()
+                self._respond(200, {"message": "Shrink complete", "result": result})
 
-        elif path == "/retry":
-            result = {}
-            for name, pool in server_instance.pools.items():
-                if pool._retry_failed():
-                    result[name] = "retrying a failed instance"
-            server_instance._save_state()
-            self._respond(200, {"message": "Retry triggered", "result": result})
+            elif path == "/retry":
+                result = {}
+                for name, pool in server_instance.pools.items():
+                    if pool._retry_failed():
+                        result[name] = "retrying a failed instance"
+                server_instance._save_state()
+                self._respond(200, {"message": "Retry triggered", "result": result})
 
-        else:
-            self._respond(404, {"message": "Not found. Use /reset, /status, /shrink, or /retry"})
+            else:
+                self._respond(404, {"message": "Not found. Use /reset, /status, /shrink, or /retry"})
+        except Exception as exc:
+            logger.exception("Unhandled request error for %s", self.path)
+            self._respond(500, {"message": str(exc), "type": type(exc).__name__})
 
     def _respond(self, code: int, body: dict):
         self.send_response(code)
